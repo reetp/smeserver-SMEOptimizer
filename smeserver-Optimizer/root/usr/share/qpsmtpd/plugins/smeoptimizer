@@ -1,0 +1,604 @@
+#!perl -w
+#############################################################################
+#
+# This script provides qpsmtpd interface to SME Optimizer services
+#
+# This script has been developed
+# by Jesper Knudsen at http://smeoptimizer.com
+#
+# Revision History:
+#
+# September 26, 2016:      Initial version
+# October 10, 2016         Added check for whether SA rule hits
+# May 21, 2017             Support for attachment check
+#
+#############################################################################
+
+use DBI;
+use Digest::SHA qw(sha1_hex sha256_hex);
+use File::Path; 
+use File::stat;
+use Net::DNS;
+
+my @no_show_types = (
+  'jpg', 'jpeg', 'png', 'gif', 'txt', 'html'
+    );
+
+my @dnsbl_zones = (
+  'dnsbl.smeoptimizer.com'
+    );
+
+sub register {
+  my ($self, $qp, @args) = @_;
+
+  eval {require Email::MIME};
+  if ($@) {
+    Qpsmtpd->varlog(LOGINFO, "init", "smeoptimizer", "Email::MIME not present - no attachment filter enabled.");
+    return;
+  }
+
+  for (@args) {
+    if (/^VTAPI=([a-z0-9A-Z]+)$/) {
+      $self->{_VTAPI} = $1;
+    }
+    if (/^DNSBL/) {
+      $self->{_DNSBLMode} = 'qpsmtpd';
+    } else {
+      $self->{_DNSBLMode} = 'spamassassin';
+    }
+  }
+
+#  $self->{_DNSBLMode} = 'qpsmtpd';
+
+  if ($self->{_DNSBLMode} eq 'qpsmtpd') {
+    $self->register_hook("connect", "hook_connect_smeoptimizer");
+    $self->register_hook("disconnect", "hook_disconnect_smeoptimizer");
+  }
+
+  if (not $self->{_VTAPI}) {
+    Qpsmtpd->varlog(LOGINFO, "init", "smeoptimizer", "No VirusTotal API key configured - no attachment filter enabled.");
+    return;
+  }
+
+  Qpsmtpd->varlog(LOGINFO, "init", "smeoptimizer", "Attachment filter enabled.");
+  $self->register_hook("data_post", "hook_data_post_smeoptimizer");
+
+  return;
+}
+
+sub connect_to_log_db {
+  my $self = shift;
+
+  # Now determine whether to use master or local DB
+  my $host = 'localhost';
+  my $database = "smeoptimizer";
+  my $user = "smeoptimizer";
+  my $pw = "password";
+
+  my $dsn = "dbi:mysql:$database:$host:3306";
+  my $connect = DBI->connect($dsn, $user, $pw, { PrintError => 0, RaiseError => 0, mysql_connect_timeout => 10 });
+
+  if (not defined($connect)) {
+    my $err = $DBI::errstr;
+    $self->log(LOGERROR, "Cannot connect to $host:$database - $err");
+    return undef;
+  }
+
+  return $connect;
+}
+
+
+sub hook_connect_smeoptimizer {
+  my ($self, $transaction) = @_;
+
+  my $remote_ip = $self->qp->connection->remote_ip;
+  my $reversed_ip = join(".", reverse(split(/\./, $remote_ip)));
+
+  # we should queue these lookups in the background and just fetch the
+  # results in the first rcpt handler ... oh well.
+
+  my $res = Net::DNS::Resolver->new (
+    dnsrch => 0
+      );
+
+  $res->tcp_timeout(30);
+  $res->udp_timeout(30);
+
+  my $sel = IO::Select->new();
+
+  my $dom;
+  for my $dnsbl (@dnsbl_zones) {
+    $dom->{"$reversed_ip.$dnsbl"} = 1;
+    $self->log(LOGINFO, "Checking $remote_ip at $dnsbl in the background");
+    $sel->add($res->bgsend("$reversed_ip.$dnsbl"));
+  }
+
+  $self->qp->connection->notes('dnsbl_sockets', $sel);
+  $self->qp->connection->notes('dnsbl_domains', $dom);
+
+  return DECLINED;
+
+}
+
+sub process_sockets {
+  my ($self) = @_;
+
+  my $conn = $self->qp->connection;
+
+  return $conn->notes('dnsbl')
+      if $conn->notes('dnsbl');
+
+  my $res = Net::DNS::Resolver->new (
+    dnsrch => 0,
+      );
+  
+  $res->tcp_timeout(30);
+  $res->udp_timeout(30);
+
+  my $sel = $conn->notes('dnsbl_sockets') or return "";
+  my $dom = $conn->notes('dnsbl_domains');
+  my $remote_ip = $self->qp->connection->remote_ip;
+
+  my $result;
+
+  $self->log(LOGDEBUG, "waiting for dnsbl dns");
+
+  # don't wait more than 8 seconds here
+  my @ready = $sel->can_read(8);
+
+  $self->log(LOGDEBUG, "DONE waiting for dnsbl dns, got " , scalar @ready, " answers ...") ;
+  return '' unless @ready;
+
+  for my $socket (@ready) {
+    my $query = $res->bgread($socket);
+    $sel->remove($socket);
+    undef $socket;
+
+    my $dnsbl;
+
+    if ($query) {
+      my $a_record = 0;
+      my $a_result = 0;
+      foreach my $rr ($query->answer) {
+        my $name = $rr->name;
+        $self->log(LOGDEBUG, "name $name");
+        next unless $dom->{$name};
+        $self->log(LOGDEBUG, "name $name was queried");
+        $a_record = 1 if $rr->type eq "A";
+        if ($rr->type eq "A") {
+          $a_result = $rr->address;
+        }
+
+        ($dnsbl) = ($name =~ m/(?:\d+\.){4}(.*)/) unless $dnsbl;
+        $dnsbl = $name unless $dnsbl;
+        next unless $rr->type eq "TXT";
+        $self->log(LOGDEBUG, "got txt record");
+        $result = $rr->txtdata and last;
+      }
+
+      if ($a_record) {
+	$result = "$dnsbl#$a_result";
+      }
+    }
+    else {
+      $self->log(LOGERROR, "$dnsbl query failed: ", $res->errorstring)
+	  unless $res->errorstring eq "NXDOMAIN";
+    }
+    
+    if ($result) {
+      #kill any other pending I/O
+      $conn->notes('dnsbl_sockets', undef);
+      return $conn->notes('dnsbl', $result);
+    }
+  }
+  if ($sel->count) {
+    # loop around if we have dns blacklists left to see results from
+    return $self->process_sockets();
+  }
+  
+  # if there was more to read; then forget it
+  $conn->notes('dnsbl_sockets', undef);
+  
+  return $conn->notes('dnsbl', $result);
+}
+
+
+
+sub hook_disconnect_smeoptimizer {
+  my ($self, $transaction) = @_;
+  
+  $self->qp->connection->notes('dnsbl_sockets', undef);
+  
+  return DECLINED;
+}
+
+sub hook_mail {
+  my ($self,$transaction, $sender) = @_;
+
+  if ($sender->host and $sender->user) {
+    my $host = lc($sender->host);
+    my $from = lc($sender->user) . '@' . $host;
+
+    $transaction->notes('SMEOptimizerFrom',$from);
+  }
+
+  return DECLINED if ($self->{_DNSBLMode} ne 'qpsmtpd');
+    
+  my $note = $self->process_sockets;
+  return DECLINED if (not defined($note));
+
+  my ($list,$result) = $note =~ m/([^\#]+)\#(.*)/;
+
+  if ( $list ) {
+    if ($list eq 'dnsbl.smeoptimizer.com') {
+      if ($result eq '127.0.0.4' or 
+	  $result eq '127.0.0.5' or 
+	  $result eq '127.0.0.6') {
+	
+	$self->log(LOGWARN, "Blacklisted by $list ($result)");	
+	return (DENY, "Blacklisted IP ($result)");
+      }
+    }
+  }
+  
+  return DECLINED;
+
+}
+
+sub hook_rcpt {
+  my ($self, $transaction, $rcpt, %param) = @_;
+
+  my $user = $rcpt->user;
+  my $host = lc $rcpt->host;
+  my $to = lc($user) . '@' . lc($host);
+
+  $transaction->notes('SMEOptimizerTo', $to);
+
+  return DECLINED;
+}
+
+sub CheckSARules {
+  my ( $self, $transaction ) = @_;
+
+  my $header = $transaction->header;
+  if ($header) {
+    my $status = $header->get('X-Spam-Status');
+    return 0 if (not $status);
+    my ($tests) = ($status =~ m/tests=(.*)/)[0];
+    
+    if ($tests) {
+      if (grep(/SMEOPTI/,$tests)) {
+	$self->log(LOGERROR, "SMEOptimizer SA hit: $tests");
+	return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+sub hook_data_post_smeoptimizer {
+  my ( $self, $transaction ) = @_;
+
+  # Reassemble the email for Email::MIME
+  $transaction->body_resetpos;
+  
+  my $em;
+
+  eval {$em = Email::MIME->new($transaction->header->as_string . $transaction->body_as_string());};
+  if ($@) {
+    my $err = $@;
+    $err =~ s/[\n\r]//;
+    $self->log(LOGERROR, " Email::MIME failed ($err)");
+    return 0;
+  }
+  
+  if (not $em) {
+    $self->log(LOGERROR, "failed to instantiate Email::MIME object");
+    return DECLINED;
+  }
+
+  # Parse mail and check all MIME parts
+  my ($status,$msg) = $self->check_attachment($transaction,$em);
+
+  return ($status, $msg)
+
+}
+
+sub check_attachment {
+  my ($self, $transaction, $mail) = @_;
+  
+  # Check the signature of the message....
+  my $filename = lc($mail->filename(1));
+
+  if ($filename) {
+    my ($status, $message) = $self->StoreAndCheckAttachment($transaction,$mail,$filename);
+    return ($status, $message) unless $status == DECLINED;
+  }
+
+  # Check parts
+  my @parts = $mail->parts;
+
+  if (@parts > 1 || $parts[0] ne $mail) {
+    foreach my $part (@parts) {
+      my ($status, $message) = $self->check_attachment($transaction,$part);
+      return ($status, $message) unless $status == DECLINED;
+    }
+  }
+  
+  return DECLINED;
+}
+
+sub StoreAndCheckAttachment {
+  my ($self, $transaction, $mail, $filename) = @_;
+
+  my ($ext) = $filename =~ /(\.[^.]+)$/;
+  if ($ext) {
+    $ext =~ s/.//;
+  }
+  
+  # Show the attachments in the log for some file extensions
+  for my $extension (@no_show_types) {
+    if ($ext eq $extension) {
+      $self->log(LOGINFO,"Not tested extension in filename: \"$filename\" ($ext)");
+      return DECLINED;
+    }
+  }
+
+  my $attachment_base_dir =  '/dev/shm';
+
+  # remove chars that does not store well.
+  $filename =~ s/[\'\/]//ig;
+  $filename =~ s/[^[:ascii:]]+//g;  # get rid of non-ASCII characters
+
+  my $uniqueid = $transaction->body_filename;
+
+  my $path = sprintf("%s/%s",$attachment_base_dir,$uniqueid);
+
+  unless (-d $path) {
+    my $rc = mkpath($path);
+  }
+  my $body = $mail->body;
+  if ($body) {
+    my $output_file = sprintf("%s/%s",$path,$filename);
+    if (open OUTPUT, ">", $output_file) {
+      print OUTPUT $body;
+      my $rc = close OUTPUT;
+      if (not $rc) {
+        $self->log(LOGINFO,"ERROR : Cannot close filename: \"$filename\" ($uniqueid)");
+        return DECLINED;
+      }
+
+      my $file_size = 0;
+      my $sb = stat($output_file);
+      if ($sb) {
+        $file_size = $sb->size();
+      }
+
+      my $sha256 = get_sha256($output_file);
+      my $sha1 = get_sha1($output_file);
+
+      $self->log(LOGINFO,"Storing filename: \"$filename\" - $file_size bytes ($sha1)");
+
+      my ($status, $message) = $self->CheckSMEOptimierAttachment($sha256,$sha1,$file_size,$filename);
+
+      rmtree($path);
+
+      return ($status, $message) unless $status == DECLINED;
+
+      # Otherwise store for later check
+      $self->StoreAttachmentInSQL($sha1,$sha256,$file_size,$filename);
+
+    } else {
+      $self->log(LOGINFO,"ERROR : Cannot store filename: \"$filename\" ($output_file)");
+
+      rmtree($path);
+      return DECLINED;
+    }
+
+  }
+
+  rmtree($path);
+  return DECLINED;
+}
+
+sub CheckSMEOptimierAttachment {
+  my ($self, $sha256, $sha1, $file_size,$filename) = @_;
+  
+#  $self->log(LOGINFO,"Checking SHA1: $sha1");
+
+  my $res  = Net::DNS::Resolver->new (
+                                      dnsrch      => 0,
+                                      recurse     => 1,
+                                      );
+
+  $res->tcp_timeout(10);
+  $res->udp_timeout(10);
+
+  my $domain = sprintf("%s.attachment.smeoptimizer.com",$sha1);
+  
+  my $query = $res->query($domain);
+  return DECLINED if (not $query);
+  
+  my $txt;
+  my $arec;
+
+  foreach my $rr ($query->answer) {
+    if ($rr->type eq 'A') {
+      $arec = $rr->address;
+    }
+  }
+
+  # Only If we find an A record
+  return DECLINED if (not $arec);
+ 
+  $query = $res->query($domain, 'TXT');
+  return DECLINED if (not $query);      
+
+  foreach my $rr ($query->answer) {
+    if ($rr->type eq 'TXT') {
+      $txt = $rr->txtdata;
+    }
+  }
+	
+  return DECLINED if (not $txt);
+
+  # Then get the SHA256 and size from TXT
+  $self->log(LOGINFO,"Found A:$arec ($txt)");
+  my ($gotsha256,$size,$desc) = $txt =~ /([^\#]+)\#([^\#]+)\#([^\#]+)/;
+  if ($gotsha256) {
+    $self->log(LOGINFO,"SHA:$gotsha256 - Size:$size - D:$desc");
+    if ($gotsha256 eq $sha256 and $size == $file_size) {
+      $self->log(LOGINFO,"Virus Found: $desc");
+      return (DENY, "Virus found: $desc");
+    }
+  }
+
+  return DECLINED;
+}
+
+sub get_sha256 {
+  my $file = shift;
+
+  my $scankey;
+  if (open FILE, "<$file") {
+    $scankey = sha256_hex(<FILE>);
+    close FILE;
+  }
+
+  return $scankey;
+}
+
+
+sub get_sha1 {
+  my $file = shift;
+
+  my $scankey;
+  if (open FILE, "<$file") {
+    $scankey = sha1_hex(<FILE>);
+    close FILE;
+  }
+
+  return $scankey;
+}
+
+
+sub hook_queue {
+  my ( $self, $transaction ) = @_;
+
+  $self->CheckSARules($transaction);
+  
+  return DECLINED;
+}
+
+sub hook_deny {
+  my ( $self, $transaction, $prev_hook, $retval, $return_text ) = @_;
+
+  $self->CheckSARules($transaction);
+
+  # Only the hard rejects
+  if (not ($retval == DENY or $retval == DENY_DISCONNECT)) {
+    return DECLINED;
+  }
+
+  # Check against list of positives where we do want 
+  # loggin details
+  if (not ($prev_hook eq 'dnsbl' or 
+	   $prev_hook eq 'rhsbl' or 
+	   $prev_hook eq 'virus::clamav' or 
+	   $prev_hook eq 'naughty' or 
+	   $prev_hook eq 'smeoptimizer')
+      ) {
+    return DECLINED;
+  }
+  
+  my $remote_ip = $self->connection->remote_ip;
+
+  my $to_addr  = $transaction->notes('SMEOptimizerTo');
+  if (not $to_addr) {
+    $to_addr = "Unknown";
+  }
+
+  my $from_addr = $transaction->notes('SMEOptimizerFrom');
+  if (not $from_addr) {
+    $from_addr = "Unknown";
+  }
+
+  my $header = $transaction->header;
+  my $header_str = '';
+  if ($header) {
+    $header_str = $header->as_string;
+  }
+
+  my $subject = '';
+  if ($header) {
+    $subject = $transaction->header->get('Subject');
+    $subject =~ s/[\n\r]//;
+  }
+
+  my $connect = $self->connect_to_log_db();
+  if (not defined($connect)) {
+    $self->log(LOGERROR, "ERROR: Cannot connect to LOG DB");
+    return DECLINED;
+  }
+
+  my $myquery = sprintf("INSERT INTO log (ipaddress,from_addr,to_addr,subject,header,qpsmtpd_hook,qpsmtpd_retval,qpsmtpd_rettext) \
+                      VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                        $connect->quote($remote_ip),
+                        $connect->quote($from_addr),
+                        $connect->quote($to_addr),
+                        $connect->quote($subject),
+                        $connect->quote($header_str),
+                        $connect->quote($prev_hook),
+                        $connect->quote($retval),
+                        $connect->quote($return_text)
+                        );
+
+
+  my $sth = $connect->prepare($myquery);
+  my $rv = $sth->execute();
+
+  if (not defined($rv)) {
+    my $err = $connect->errstr();
+    $self->log(LOGERROR, "Cannot insert into log - $err");
+  }
+
+  $connect->disconnect;
+
+  return DECLINED;
+
+}
+
+sub StoreAttachmentInSQL {
+  my ($self, $sha1, $sha256, $file_size,$filename) = @_;
+
+  # Do not bother with very small files.
+  return if ($file_size < 750);
+
+  my $connect = $self->connect_to_log_db();
+  if (not defined($connect)) {
+    $self->log(LOGERROR, "ERROR: Cannot connect to SME Optimizer DB");
+    return DECLINED;
+  }
+
+  my $myquery = sprintf("INSERT INTO attachments (sha1,sha256,size,filename) VALUES (%s,%s,%s,%s) ON DUPLICATE KEY UPDATE abstime=NOW()",
+                        $connect->quote($sha1),
+                        $connect->quote($sha256),
+                        $connect->quote($file_size),
+                        $connect->quote($filename)
+      );
+  
+  
+  my $sth = $connect->prepare($myquery);
+  my $rv = $sth->execute();
+  
+  if (not defined($rv)) {
+    my $err = $connect->errstr();
+    $self->log(LOGERROR, "Cannot insert into attachments - $err");
+  }
+
+  $connect->disconnect;
+
+  return DECLINED;
+
+
+}

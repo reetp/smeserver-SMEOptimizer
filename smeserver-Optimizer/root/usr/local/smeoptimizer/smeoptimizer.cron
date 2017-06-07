@@ -1,0 +1,23 @@
+#!/bin/bash
+##########################################
+# SMEOptimzer Cron Configuration        
+# Version 2.2
+##########################################
+
+/usr/local/smeoptimizer/SMEOptimizer.pl -crontab -getconfig
+
+MD5OLD=`/usr/bin/md5sum /usr/local/smeoptimizer/SMEOptimizer.pl | awk '{ print $1 }'`
+
+# First check for main program updats
+if [ -f "/usr/local/smeoptimizer/SMEOptimizer.pl.updated" ]; then
+
+ MD5NEW=`/usr/bin/md5sum /usr/local/smeoptimizer/SMEOptimizer.pl.updated | awk '{ print $1 }'`
+
+ # if different, then update
+ if [ "$MD5OLD" != "$MD5NEW" ]; then
+   cp --remove-destination /usr/local/smeoptimizer/SMEOptimizer.pl.updated /usr/local/smeoptimizer/SMEOptimizer.pl
+   chmod +x /usr/local/smeoptimizer/SMEOptimizer.pl
+ fi
+fi
+
+/usr/local/smeoptimizer/SMEOptimizer.pl -crontab -reportspam

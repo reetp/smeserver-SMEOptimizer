@@ -1,0 +1,9 @@
+{
+    # Version 1.1
+
+    my $min = int(rand(60));
+
+    $OUT .=  "# make sure the reporting for SMEOptimizer is at random hours\n";
+    $OUT .=  "$min * * * * root /usr/local/smeoptimizer/smeoptimizer.cron\n";
+
+}

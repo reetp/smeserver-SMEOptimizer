@@ -1,0 +1,29 @@
+{
+  use esmith::ConfigDB;
+
+  my $dbh = esmith::ConfigDB->open();
+
+  my $rec = $dbh->get("smeoptimizer");
+  if (not $rec) {
+     $rec = $dbh->new_record("smeoptimizer",
+                            { type => "service" },
+                            { status => "enabled" },
+          );
+  }
+  my $VTAPI = $dbh->get('smeoptimizer')->prop('VTAPI') || '';
+  my $DNSBL = $dbh->get('smeoptimizer')->prop('DNSBL') || '';
+
+  if ($VTAPI eq '' and $DNSBL eq '') {
+    return "smeoptimizer";
+  } else {
+    my $options;
+    if ($VTAPI ne '') {
+      $options .= sprintf("VTAPI=%s",$VTAPI);
+    }
+    if ($DNSBL eq 'qpsmtpd') {
+      $options .= sprintf(" DNSBL");
+    }
+
+    return sprintf("smeoptimizer %s",$options);
+  }
+}
